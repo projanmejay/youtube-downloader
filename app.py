@@ -2,30 +2,37 @@ import streamlit as st
 import yt_dlp
 from pathlib import Path
 import time
+import os
+
+# ---------------- CONFIG ----------------
+# On Render, use a relative path. Ensure this file is in your GitHub repo
+# or uploaded as a "Secret File" in Render.
+COOKIES_PATH = "www.youtube.com_cookies.txt"
+
+# Path to ffmpeg (installed via render-build.sh)
+FFMPEG_LOCATION = "./ffmpeg"
+
+ALLOWED_HEIGHTS = [480, 720, 1080, 1440, 2160, 4320]
+
+# Use /tmp for temporary storage on cloud platforms
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="YouTube Downloader", page_icon="📥")
 st.title("📥 YouTube Video Downloader")
 st.caption(
-    "Select quality → download starts → save via browser (correct file guaranteed)"
+    "Select quality → download starts → save via browser"
 )
-
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 url = st.text_input("🎬 Enter YouTube URL")
 
 progress_bar = st.progress(0)
 status_text = st.empty()
 
-# Allowed qualities
-ALLOWED_HEIGHTS = [480, 720, 1080, 1440, 2160, 4320]
-
-# -------- Session State --------
+# ---------------- Session State ----------------
 if "qualities" not in st.session_state:
     st.session_state.qualities = []
-if "title" not in st.session_state:
-    st.session_state.title = ""
 if "file_path" not in st.session_state:
     st.session_state.file_path = None
 if "downloading" not in st.session_state:
@@ -33,27 +40,31 @@ if "downloading" not in st.session_state:
 if "selected_quality" not in st.session_state:
     st.session_state.selected_quality = None
 
-
 # ---------------- Functions ----------------
 
 def fetch_qualities(video_url):
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
+        "cookies": COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
 
-    qualities = sorted(
-        {
-            f["height"]
-            for f in info["formats"]
-            if f.get("vcodec") != "none"
-            and f.get("height") in ALLOWED_HEIGHTS
-        }
-    )
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
 
-    return qualities, info.get("title", "video")
+        qualities = sorted(
+            {
+                f.get("height")
+                for f in info.get("formats", [])
+                if f.get("vcodec") != "none"
+                and f.get("height") in ALLOWED_HEIGHTS
+            }
+        )
+        return qualities
+    except Exception as e:
+        st.error(f"Error fetching info: {e}")
+        return []
 
 
 def progress_hook(d):
@@ -73,7 +84,7 @@ def progress_hook(d):
         )
 
     elif d["status"] == "finished":
-        status_text.text("🔧 Finalizing video (FFmpeg CFR)...")
+        status_text.text("🔧 Finalizing video (merging audio/video)...")
 
 
 def start_download():
@@ -89,28 +100,29 @@ def start_download():
     height = st.session_state.selected_quality
     timestamp = int(time.time())
 
-    # ✅ Unique & controlled filename (CRITICAL FIX)
     output_file = DOWNLOAD_DIR / f"video_{height}p_{timestamp}.mp4"
 
     ydl_opts = {
-        # best video at chosen height + best audio
         "format": f"bestvideo[height={height}]+bestaudio/best",
         "outtmpl": str(output_file),
         "merge_output_format": "mp4",
-        # Force CFR & fix timestamps
-        "postprocessor_args": {
-            "ffmpeg": ["-movflags", "+faststart", "-vsync", "cfr"]
-        },
+        "cookies": COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
+        "ffmpeg_location": FFMPEG_LOCATION,
         "progress_hooks": [progress_hook],
+        "postprocessor_args": [
+            "-movflags", "+faststart",
+        ],
         "quiet": True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-    # ✅ EXACT file path saved (no guessing)
-    st.session_state.file_path = output_file
-    st.session_state.downloading = False
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        st.session_state.file_path = output_file
+    except Exception as e:
+        st.error(f"Download failed: {e}")
+    finally:
+        st.session_state.downloading = False
 
 
 # ---------------- Main UI ----------------
@@ -119,32 +131,36 @@ if url:
     if "youtube.com" not in url and "youtu.be" not in url:
         st.error("❌ Invalid YouTube URL")
     else:
+        # Clear qualities if URL changes
+        if "last_url" not in st.session_state or st.session_state.last_url != url:
+            st.session_state.qualities = []
+            st.session_state.file_path = None
+            st.session_state.last_url = url
+
         if not st.session_state.qualities:
             with st.spinner("🔍 Fetching available qualities..."):
-                q, t = fetch_qualities(url)
-                st.session_state.qualities = q
-                st.session_state.title = t
+                st.session_state.qualities = fetch_qualities(url)
 
         if st.session_state.qualities:
             st.selectbox(
-                "🎯 Select Quality (download starts automatically)",
+                "🎯 Select Quality",
                 st.session_state.qualities,
                 format_func=lambda x: f"{x}p",
                 key="selected_quality",
                 on_change=start_download,
             )
         else:
-            st.warning("⚠️ None of the selected qualities are available for this video.")
+            st.warning("⚠️ No supported qualities found.")
 
 
-# ---------------- Final Browser Download ----------------
+# ---------------- Download Button ----------------
 
-if st.session_state.file_path:
-    st.success("✅ Video ready to download")
+if st.session_state.file_path and os.path.exists(st.session_state.file_path):
+    st.success("✅ Video ready!")
 
     with open(st.session_state.file_path, "rb") as f:
         st.download_button(
-            label="⬇️ Download Video",
+            label="⬇️ Click here to Save to Device",
             data=f,
             file_name=st.session_state.file_path.name,
             mime="video/mp4",
